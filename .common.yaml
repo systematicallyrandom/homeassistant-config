@@ -1,0 +1,48 @@
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+  
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+
+captive_portal:
+
+logger:
+  baud_rate: 0  # Disable UART logging
+
+api:
+  encryption: 
+    key: !secret api_key
+  # prevent auto-reboot on api connect failure 
+  # (prevents constantly turning off lights on server/network issues)
+  reboot_timeout: 0s 
+
+# Enable reboot / uptime sensor in HA to detect device instability 
+sensor:
+  - platform: uptime
+    name: Last Boot
+    id: uptime_timestamp
+    type: timestamp
+    entity_category: diagnostic
+
+ # Get the time from Home Assistant to sync the onboard real-time-clock.  
+time:
+  - platform: homeassistant
+    id: ha_time
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+web_server:
+  port: 80
+  auth:
+    username: !secret web_username
+    password: !secret web_password
+
+button:
+  - platform: restart
+    name: "Restart"
+    disabled_by_default: true
+    entity_category: diagnostic
