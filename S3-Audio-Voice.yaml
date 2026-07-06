@@ -1,0 +1,604 @@
+# =============================================================================
+#  Waveshare ESP32-S3-AUDIO-Board  ->  Home Assistant Voice (PE-style assistant)
+# =============================================================================
+#  Goal: replicate the Home Assistant Voice Preview Edition behaviour as closely
+#  as the hardware allows — on-device wake word (microWakeWord), full Assist
+#  pipeline, LED-ring state feedback, hardware mute, amplifier control, volume
+#  + action keys, announcements, and voice timers.
+#
+#  Board hardware (ESP32-S3R8, 16MB flash / 8MB octal PSRAM):
+#    ES7210  microphone ADC  (I2C)        -> I2S mic data  DIN  = GPIO15
+#    ES8311  DAC / codec      (I2C)        -> I2S spk data  DOUT = GPIO16
+#    TCA9555 GPIO expander    (I2C @0x20)  -> keys + amplifier enable
+#    WS2812  7-LED RGB ring                -> GPIO38
+#    Shared I2S clocks: MCLK=GPIO12  BCLK=GPIO13  LRCLK=GPIO14
+#    I2C bus:           SDA=GPIO11   SCL=GPIO10
+#    Amplifier enable:  TCA9555 pin 8
+#    User keys:         TCA9555 pins 9 / 10 / 11
+#
+#  The codecs are the I2S clock masters (ESP32 I2S runs in "secondary" mode),
+#  so the ES8311 is forced into master mode. Pins were verified against a
+#  working community build for this exact board.
+#
+#  Pairs with your shared `.common.yaml` (wifi / api / ota / logger /
+#  web_server / time:ha_time / uptime sensor / restart button), included below
+#  as a package. Only `wifi:` is *extended* here (power-save off, needed for
+#  glitch-free audio streaming); everything else comes from the package.
+# =============================================================================
+
+substitutions:
+  name: "waveshare-s3-audio-voice-852a1c"
+  friendly_name: "S3 Audio Voice"
+
+  # --- pin map (edit only if your board revision differs) ---
+  i2c_sda:   GPIO11
+  i2c_scl:   GPIO10
+  i2s_mclk:  GPIO12
+  i2s_bclk:  GPIO13
+  i2s_lrclk: GPIO14
+  i2s_din:   GPIO15      # mic data  (from ES7210)
+  i2s_dout:  GPIO16      # speaker data (to ES8311)
+  led_pin:   GPIO38
+  led_count: "7"
+  amp_ctrl:  "8"         # TCA9555 pin driving the amplifier enable
+
+  # --- audio params ---
+  sample_rate:   "16000"
+  mclk_multiple: "256"
+
+packages:
+  # Your shared base config. Rename if your file is `_common.yaml`.
+  common: !include .common.yaml
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2025.8.0
+  on_boot:
+    - priority: -100
+      then:
+        # Light the ring FIRST so a bad ADC can't stop us reaching it.
+        # Do NOT touch the ES7210 here: calling set_mic_gain() before the
+        # codec is up (e.g. if it failed I2C init) dereferences an invalid
+        # pointer and crashes with LoadProhibited. The ES7210 uses its own
+        # default gain; the "Microphone Gain" number adjusts it at runtime.
+        - lambda: |-
+            id(mic_is_muted) = false;
+            id(va_phase) = 10;   // not ready
+        - script.execute: control_leds
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  cpu_frequency: 240MHz
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    version: recommended
+    # ESPHome 2026.4+ moves ring-buffer functions to flash by default to save
+    # IRAM. Running them from flash (XIP) slows the audio path enough that the
+    # wake-word inference task can't drain its buffer fast enough (constant
+    # "Not enough free bytes in ring buffer" resets). Pin them back in IRAM.
+    advanced:
+      ringbuf_in_iram: true
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+
+psram:
+  mode: octal      # ESP32-S3R8 = octal PSRAM
+  speed: 80MHz
+
+# --- Extend (not redefine) the package wifi: audio streaming needs PS off ---
+wifi:
+  power_save_mode: none
+
+# Keep logging light: VERBOSE on the audio components starves the wake-word
+# inference task (ring-buffer overflow) and can crash with LoadProhibited.
+logger:
+  level: DEBUG
+
+# =============================================================================
+#  Buses & codecs
+# =============================================================================
+i2c:
+  - id: internal_i2c
+    sda: ${i2c_sda}
+    scl: ${i2c_scl}
+    frequency: 400kHz
+
+tca9555:
+  - id: ioexp
+    i2c_id: internal_i2c
+    address: 0x20
+
+# Single full-duplex I2S bus with the ESP32 as master. The ESP drives
+# MCLK/BCLK/LRCK continuously, so the mic always has a valid clock at the
+# correct rate. The previous two-bus / ES8311-as-master topology could not be
+# timed reliably on current ESPHome and starved/overran the wake-word buffer.
+i2s_audio:
+  - id: i2s_audio_bus
+    i2s_mclk_pin: ${i2s_mclk}
+    i2s_bclk_pin: ${i2s_bclk}
+    i2s_lrclk_pin: ${i2s_lrclk}
+
+audio_adc:
+  - platform: es7210
+    id: adc_mic
+    i2c_id: internal_i2c
+
+audio_dac:
+  - platform: es8311
+    id: dac_spk
+    i2c_id: internal_i2c
+
+# =============================================================================
+#  Microphone / speaker / media player
+# =============================================================================
+microphone:
+  - platform: i2s_audio
+    id: mic
+    i2s_din_pin: ${i2s_din}
+    i2s_audio_id: i2s_audio_bus
+    adc_type: external
+    pdm: false
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_speaker
+    i2s_dout_pin: ${i2s_dout}
+    i2s_audio_id: i2s_audio_bus
+    dac_type: external
+    audio_dac: dac_spk
+    # NO `timeout: never` here. On the single shared bus the speaker must
+    # release the I2S peripheral when idle, or the mic can never re-acquire it
+    # ("Driver failed to start", stuck retrying after the first reply).
+    buffer_duration: 100ms
+
+  # Mixer lets TTS announcements duck media playback (VPE behaviour).
+  - platform: mixer
+    id: speaker_mixer
+    output_speaker: i2s_speaker
+    num_channels: 2
+    source_speakers:
+      - id: announcement_mixing_input
+        timeout: never
+      - id: media_mixing_input
+        timeout: never
+
+  - platform: resampler
+    id: announcement_speaker
+    output_speaker: announcement_mixing_input
+  - platform: resampler
+    id: media_speaker
+    output_speaker: media_mixing_input
+
+media_player:
+  - platform: speaker
+    id: media_out
+    name: Media Player
+    announcement_pipeline:
+      speaker: announcement_speaker
+      format: FLAC
+      num_channels: 1
+      sample_rate: 48000
+    media_pipeline:
+      speaker: media_speaker
+      format: FLAC
+      sample_rate: 48000
+    volume_increment: 0.05
+    volume_min: 0.4
+    volume_max: 0.85
+    on_announcement:
+      - mixer_speaker.apply_ducking:
+          id: media_mixing_input
+          decibel_reduction: 20
+          duration: 0.0s
+    on_state:
+      - if:
+          condition:
+            and:
+              - not: { voice_assistant.is_running: }
+              - not: { media_player.is_announcing: }
+          then:
+            - mixer_speaker.apply_ducking:
+                id: media_mixing_input
+                decibel_reduction: 0
+                duration: 1.0s
+    files:
+      - id: snd_wake
+        file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
+      - id: snd_mute_on
+        file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/mute_switch_on.flac
+      - id: snd_mute_off
+        file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/mute_switch_off.flac
+      - id: snd_timer
+        file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/timer_finished.flac
+
+# =============================================================================
+#  Wake word + Assist pipeline
+# =============================================================================
+micro_wake_word:
+  id: mww
+  microphone: mic
+  models:
+    - model: okay_nabu
+    - model: hey_jarvis
+  vad:
+
+  on_wake_word_detected:
+    - if:
+        condition:
+          switch.is_off: mic_mute
+        then:
+          - if:
+              # A wake word silences a ringing timer instead of starting Assist.
+              condition:
+                switch.is_on: timer_ringing
+              then:
+                - switch.turn_off: timer_ringing
+              else:
+                - if:
+                    condition: { switch.is_on: wake_sound }
+                    then:
+                      - script.execute:
+                          id: play_sound
+                          priority: true
+                          sound_file: !lambda return id(snd_wake);
+                # Start Assist. When on_wake_word_detected is defined, the
+                # pipeline does NOT auto-start — you must start it explicitly.
+                - voice_assistant.start:
+
+voice_assistant:
+  id: va
+  microphone: mic
+  media_player: media_out
+  micro_wake_word: mww
+  use_wake_word: false
+  noise_suppression_level: 0
+  auto_gain: 0dBFS
+  volume_multiplier: 1.0
+
+  on_client_connected:
+    - micro_wake_word.start:
+    - lambda: id(va_phase) = 1;   // idle / ready
+    - script.execute: control_leds
+  on_client_disconnected:
+    - voice_assistant.stop:
+    - micro_wake_word.stop:
+    - lambda: id(va_phase) = 10;  // not ready
+    - script.execute: control_leds
+
+  on_listening:
+    - lambda: id(va_phase) = 2;   // woke, waiting
+    - script.execute: control_leds
+  on_stt_vad_start:
+    - lambda: id(va_phase) = 3;   // hearing you
+    - script.execute: control_leds
+  on_stt_vad_end:
+    - lambda: id(va_phase) = 4;   // thinking
+    - script.execute: control_leds
+  on_tts_start:
+    - lambda: id(va_phase) = 5;   // replying
+    - script.execute: control_leds
+  on_start:
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 30
+        duration: 0.0s
+  on_end:
+    - wait_until:
+        not: { voice_assistant.is_running: }
+    - mixer_speaker.apply_ducking:
+        id: media_mixing_input
+        decibel_reduction: 0
+        duration: 1.0s
+    - lambda: id(va_phase) = 1;   // back to idle
+    - script.execute: control_leds
+    # Re-arm wake-word detection. micro_wake_word stops itself when it hands
+    # the mic to Assist, so without this restart the device only responds once.
+    # On the shared duplex bus, the speaker keeps holding the I2S peripheral for
+    # a moment after the reply "finishes" — restart the mic too soon and its
+    # driver fails to start and gets stuck retrying. Wait out the announcement
+    # and give the bus time to release before re-acquiring it for the mic.
+    - wait_until:
+        not: { media_player.is_announcing: }
+    - delay: 300ms
+    # Force the speaker to hand back the shared I2S bus before the mic grabs it.
+    - speaker.stop: i2s_speaker
+    - delay: 200ms
+    - micro_wake_word.start:
+  on_error:
+    - lambda: id(va_phase) = 11;  // error
+    - script.execute: control_leds
+    - delay: 1s
+    - lambda: id(va_phase) = 1;
+    - script.execute: control_leds
+  on_timer_finished:
+    - switch.turn_on: timer_ringing
+
+# =============================================================================
+#  Status LED ring (VPE-style colour feedback)
+#    timer ringing  -> red, fast pulse  (overrides everything)
+#    muted          -> dim red, solid
+#    error (11)     -> red, solid
+#    not ready (10) -> dim orange, solid
+#    idle (1)       -> off
+#    waiting (2)    -> blue, solid
+#    listening (3)  -> blue, medium pulse
+#    thinking (4)   -> blue, fast pulse
+#    replying (5)   -> blue, bright solid
+# =============================================================================
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_ring
+    name: Status Ring
+    pin: ${led_pin}
+    num_leds: ${led_count}
+    chipset: WS2812
+    rgb_order: RGB
+    default_transition_length: 150ms
+    effects:
+      - pulse:
+          name: "Pulse Medium"
+          min_brightness: 30%
+          max_brightness: 100%
+          transition_length: 600ms
+          update_interval: 16ms
+      - pulse:
+          name: "Pulse Fast"
+          min_brightness: 30%
+          max_brightness: 100%
+          transition_length: 300ms
+          update_interval: 16ms
+
+script:
+  # Plays a built-in sound file through the announcement pipeline.
+  - id: play_sound
+    parameters:
+      priority: bool
+      sound_file: "audio::AudioFile*"
+    then:
+      - lambda: |-
+          if (priority) {
+            id(media_out)->make_call()
+              .set_command(media_player::MediaPlayerCommand::MEDIA_PLAYER_COMMAND_STOP)
+              .set_announcement(true).perform();
+          }
+          if (priority ||
+              id(media_out).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING) {
+            id(media_out)->play_file(sound_file, true, false);
+          }
+
+  # Single source of truth for the ring; called on every state change.
+  - id: control_leds
+    mode: restart
+    then:
+      - if:
+          condition: { switch.is_on: timer_ringing }
+          then:
+            - light.turn_on: { id: status_ring, red: 100%, green: 0%, blue: 0%, brightness: 100%, effect: "Pulse Fast" }
+      - if:
+          condition:
+            and:
+              - switch.is_off: timer_ringing
+              - lambda: "return id(mic_is_muted);"
+          then:
+            - light.turn_on: { id: status_ring, red: 100%, green: 0%, blue: 0%, brightness: 20%, effect: "None" }
+      - if:
+          condition:
+            and:
+              - switch.is_off: timer_ringing
+              - lambda: "return !id(mic_is_muted) && id(va_phase) == 11;"
+          then:
+            - light.turn_on: { id: status_ring, red: 100%, green: 0%, blue: 0%, brightness: 80%, effect: "None" }
+      - if:
+          condition:
+            and:
+              - switch.is_off: timer_ringing
+              - lambda: "return !id(mic_is_muted) && id(va_phase) == 10;"
+          then:
+            - light.turn_on: { id: status_ring, red: 100%, green: 45%, blue: 0%, brightness: 15%, effect: "None" }
+      - if:
+          condition:
+            and:
+              - switch.is_off: timer_ringing
+              - lambda: "return !id(mic_is_muted) && id(va_phase) == 1;"
+          then:
+            - light.turn_off: status_ring
+      - if:
+          condition:
+            and:
+              - switch.is_off: timer_ringing
+              - lambda: "return !id(mic_is_muted) && id(va_phase) == 2;"
+          then:
+            - light.turn_on: { id: status_ring, red: 0%, green: 40%, blue: 100%, brightness: 70%, effect: "None" }
+      - if:
+          condition:
+            and:
+              - switch.is_off: timer_ringing
+              - lambda: "return !id(mic_is_muted) && id(va_phase) == 3;"
+          then:
+            - light.turn_on: { id: status_ring, red: 0%, green: 40%, blue: 100%, brightness: 100%, effect: "Pulse Medium" }
+      - if:
+          condition:
+            and:
+              - switch.is_off: timer_ringing
+              - lambda: "return !id(mic_is_muted) && id(va_phase) == 4;"
+          then:
+            - light.turn_on: { id: status_ring, red: 0%, green: 40%, blue: 100%, brightness: 100%, effect: "Pulse Fast" }
+      - if:
+          condition:
+            and:
+              - switch.is_off: timer_ringing
+              - lambda: "return !id(mic_is_muted) && id(va_phase) == 5;"
+          then:
+            - light.turn_on: { id: status_ring, red: 0%, green: 50%, blue: 100%, brightness: 100%, effect: "None" }
+
+# =============================================================================
+#  State, switches, controls, keys
+# =============================================================================
+globals:
+  - id: va_phase
+    type: int
+    restore_value: false
+    initial_value: "10"
+  - id: mic_is_muted
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+switch:
+  # Amplifier enable (TCA9555 pin 8) — must be on to hear anything.
+  - platform: gpio
+    id: amp_enable
+    name: Amplifier
+    icon: mdi:speaker
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_ON
+    pin:
+      tca9555: ioexp
+      number: ${amp_ctrl}
+
+  # Hardware-style mute: zeroes the ES7210 gain (mic stays wired, just deaf).
+  - platform: template
+    id: mic_mute
+    name: Microphone Mute
+    icon: mdi:microphone-off
+    restore_mode: RESTORE_DEFAULT_OFF
+    lambda: "return id(mic_is_muted);"
+    turn_on_action:
+      - lambda: |-
+          id(mic_is_muted) = true;
+          id(adc_mic).set_mic_gain(0.0f);
+      - if:
+          condition: { switch.is_on: mute_sound }
+          then:
+            - script.execute:
+                id: play_sound
+                priority: true
+                sound_file: !lambda return id(snd_mute_on);
+      - script.execute: control_leds
+    turn_off_action:
+      - lambda: |-
+          id(mic_is_muted) = false;
+          id(adc_mic).set_mic_gain(id(mic_gain).state);
+      - if:
+          condition: { switch.is_on: mute_sound }
+          then:
+            - script.execute:
+                id: play_sound
+                priority: true
+                sound_file: !lambda return id(snd_mute_off);
+      - script.execute: control_leds
+
+  - platform: template
+    id: wake_sound
+    name: Wake chime
+    icon: mdi:bullhorn
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: template
+    id: mute_sound
+    name: Mute chime
+    icon: mdi:bullhorn
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  # Internal: rings the LED + sound when a voice timer finishes.
+  # On the shared I2S bus the alarm can't play while micro_wake_word holds the
+  # mic ("Parent bus is busy"), so stop wake-word detection for the duration of
+  # the ring and re-arm it on dismiss. While ringing, the mic is off, so the
+  # timer is dismissed with the Action key (or by toggling it from HA).
+  - platform: template
+    id: timer_ringing
+    optimistic: true
+    internal: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - micro_wake_word.stop:
+      - delay: 200ms
+      - script.execute: control_leds
+      - repeat:
+          count: 20          # auto-dismiss after ~60 s (20 x 3 s) if no button
+          then:
+            - if:
+                condition: { switch.is_on: timer_ringing }
+                then:
+                  - script.execute:
+                      id: play_sound
+                      priority: true
+                      sound_file: !lambda return id(snd_timer);
+                  - delay: 3s
+      - switch.turn_off: timer_ringing
+    on_turn_off:
+      - speaker.stop: i2s_speaker
+      - delay: 200ms
+      - script.execute: control_leds
+      - micro_wake_word.start:
+
+number:
+  - platform: template
+    id: mic_gain
+    name: Microphone Gain
+    icon: mdi:microphone-settings
+    entity_category: config
+    unit_of_measurement: dB
+    min_value: 0
+    max_value: 37.5
+    step: 1.5
+    initial_value: 24
+    optimistic: true
+    restore_value: true
+    set_action:
+      - lambda: |-
+          if (!id(mic_is_muted)) { id(adc_mic).set_mic_gain(x); }
+
+button:
+  - platform: factory_reset
+    name: Factory Reset
+    entity_category: diagnostic
+    disabled_by_default: true
+
+# TCA9555 user keys, in physical order: +(9), Action(10), -(11).
+# Pins are active-low, hence inverted: true.
+binary_sensor:
+  - platform: gpio
+    name: "Key: Volume Up"
+    pin: { tca9555: ioexp, number: 9, inverted: true }
+    on_press:
+      - media_player.volume_up: media_out
+
+  # Action key (VPE "center button"): dismiss a ringing timer, else start
+  # Assist, or stop it if already running.
+  - platform: gpio
+    name: "Key: Action"
+    pin: { tca9555: ioexp, number: 10, inverted: true }
+    on_press:
+      - if:
+          condition: { switch.is_on: timer_ringing }
+          then:
+            - switch.turn_off: timer_ringing
+          else:
+            - if:
+                condition: { voice_assistant.is_running: }
+                then:
+                  - voice_assistant.stop:
+                else:
+                  - if:
+                      condition: { switch.is_off: mic_mute }
+                      then:
+                        - voice_assistant.start:
+
+  - platform: gpio
+    name: "Key: Volume Down"
+    pin: { tca9555: ioexp, number: 11, inverted: true }
+    on_press:
+      - media_player.volume_down: media_out
